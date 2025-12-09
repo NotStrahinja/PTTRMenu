@@ -24,6 +24,6 @@ Just run the build.bat file provided. It will build both the menu DLL and the in
 # How to use
 You need an injector and the main menu DLL file. You can either use a third party DLL injector, or my own.
 1. Run the game
-2. Run: `inject.exe PaintTheTownRed.exe main.dll`
+2. Run `inject.exe PaintTheTownRed.exe main.dll` in CMD.
 3. Done
-Now you can use F3 to toggle the menu, and F4 to eject it (aka unload the DLL).
+Now you can use F3 to toggle the menu, and F4 to eject it (unload the DLL).
