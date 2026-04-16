@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <unordered_set>
+#include <algorithm>
 #include "kiero.h"
 
 #include "imgui.h"
@@ -10,67 +12,66 @@
 
 #include "MinHook.h"
 
-#define SET_HEALTH_RVA 0x72B2C0 // SetHealth() function
-#define UPDATE_RVA 0x71F8B0
-#define SET_SPECIAL_RVA 0x72BC50
-#define GET_KICK_COOLDOWN_RVA 0x719050
-#define SET_KICK_COOLDOWN_RVA 0x7190C0
-#define DISABLE_CONTROLS_RVA 0x4717F0
-#define ENABLE_CONTROLS_RVA 0x471770
-#define CURSOR_VISIBLE_SET_RVA 0x1256F00
-#define CURSOR_LOCK_SET_RVA 0x1256FA0
+#include "globals.h"
+#include "hooks.h"
 
-struct PTTRPlayer {};
+Camera* mainCam;
 
-typedef void(__fastcall* PTTRPlayer_Update_t)(void* self, void* methodInfo);
+std::unordered_set<Enemy*> enemies;
+
 PTTRPlayer_Update_t oUpdate = nullptr;
 PTTRPlayer* gPlayerInstance = nullptr;
 
-bool godMode = false;
-bool infiniteSpecial = false;
-bool enableCooldown = false;
-
-typedef void(*SetHealthFn)(PTTRPlayer* __this, float hp, bool lowering, void* method);
-SetHealthFn SetHealth = nullptr;
-
-typedef void(*SetSpecialFn)(PTTRPlayer* __this, float setSpecialTo, void* method);
-SetSpecialFn SetSpecial = nullptr;
-
-typedef float (*GetKickCooldownFn)(PTTRPlayer* self, const void* method);
-typedef void (*SetKickCooldownFn)(PTTRPlayer* self, float value, const void* method);
-GetKickCooldownFn GetKickCooldown = nullptr;
-SetKickCooldownFn SetKickCooldown = nullptr;
-
-typedef void (*DisableGameplayControlsFn)();
-DisableGameplayControlsFn oDisableGameplayControls = nullptr;
-typedef void (*EnableGameplayControlsFn)();
-EnableGameplayControlsFn oEnableGameplayControls = nullptr;
-
-typedef void(*tSetVisible)(bool value, void* method);
-tSetVisible oSetVisible;
-typedef void(*tSetLockState)(int state, void* method);
-tSetLockState oSetLockState;
+Enemy_DoUpdate_t oEnemyDoUpdate = nullptr;
 
 bool show_menu = true;
 
-void __fastcall hkUpdate(PTTRPlayer* self, void* methodInfo)
+HWND gHwnd = nullptr;
+
+Vector3 screen;
+
+void SetMenuCursorState(bool menuOpen);
+
+void __fastcall hook::Update(PTTRPlayer* self, void* methodInfo)
 {
     if(!gPlayerInstance)
         gPlayerInstance = self;
 
-    if(godMode)
-        SetHealth(self, 9999.f, false, nullptr);
+    if(hook::HasWeapon(self, nullptr))
+    {
+        hook::weapon = hook::CurrentWeapon(self, nullptr);
+    }
+    else
+    {
+        hook::weapon = nullptr;
+    }
 
-    if(infiniteSpecial)
-        SetSpecial(self, 9999.f, nullptr);
+    if(hook::weapon && global::unbreakable)
+    {
+        bool* unbreakablePtr = (bool*)((uintptr_t)hook::weapon + offset::UNBREAKABLE_FIELD_OFFSET);
+        *unbreakablePtr = true;
+    }
 
-    if(enableCooldown)
-        SetKickCooldown(self, 1.0f, nullptr);
+    if(global::godMode)
+        hook::SetHealth(self, 9999.f, false, nullptr);
+
+    if(global::infiniteSpecial)
+        hook::SetSpecial(self, 9999.f, nullptr);
+
+    if(global::enableCooldown)
+        hook::SetKickCooldown(self, 1.0f, nullptr);
 
     oUpdate(self, methodInfo);
+
+    SetMenuCursorState(show_menu);
 }
 
-#include <d3d11.h>
+void __fastcall hook::EnemyDoUpdate(Enemy* self, float deltaTime, void* method)
+{
+    enemies.insert(self);
+
+    oEnemyDoUpdate(self, deltaTime, method);
+}
 
 HINSTANCE dll_handle;
 
@@ -78,21 +79,53 @@ bool show_canvas = false;
 float speed = 0.5f;
 bool is_ejecting = false;
 
-void hkDisableGameplayControls()
+void hook::DisableGameplayControls()
 {
     if(show_menu)
         return;
-    oDisableGameplayControls();
+    hook::oDisableGameplayControls();
 }
 
-void hkEnableGameplayControls()
+void hook::EnableGameplayControls()
 {
     if(!show_menu)
         return;
-    oEnableGameplayControls();
+    hook::oEnableGameplayControls();
 }
 
-typedef HRESULT(__stdcall* Present)(IDXGISwapChain*, UINT, UINT);
+bool lastMenuState = false;
+
+void SetMenuCursorState(bool menuOpen)
+{
+    if(gHwnd)
+    {
+        if(menuOpen)
+        {
+            RECT rect;
+            GetClientRect(gHwnd, &rect);
+            MapWindowPoints(gHwnd, nullptr, (POINT*)&rect, 2);
+            ClipCursor(&rect);
+        }
+        else
+        {
+            ClipCursor(nullptr);
+        }
+    }
+
+    if(menuOpen != lastMenuState)
+    {
+        if(menuOpen)
+        {
+            while(ShowCursor(true) < 0);
+        }
+        else
+        {
+            ShowCursor(false);
+        }
+        lastMenuState = menuOpen;
+    }
+}
+
 Present oPresent = nullptr;
 
 WNDPROC oWndProc;
@@ -112,7 +145,28 @@ LRESULT __stdcall WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
-HWND gHwnd = nullptr;
+void AddOutlinedText(ImDrawList* draw,
+                     ImVec2 pos,
+                     ImU32 text_color,
+                     ImU32 outline_color,
+                     const char* text,
+                     float thickness = 1.0f)
+{
+    for(int dx = -1; dx <= 1; dx++)
+    {
+        for(int dy = -1; dy <= 1; dy++)
+        {
+            if(dx == 0 && dy == 0)
+                continue;
+
+            ImVec2 offset(pos.x + dx * thickness, pos.y + dy * thickness);
+
+            draw->AddText(offset, outline_color, text);
+        }
+    }
+
+    draw->AddText(pos, text_color, text);
+}
 
 HRESULT __stdcall detour_present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
 {
@@ -141,23 +195,31 @@ HRESULT __stdcall detour_present(IDXGISwapChain* pSwapChain, UINT SyncInterval, 
 
             ImGui::CreateContext();
             ImGuiIO& io = ImGui::GetIO();
-            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
             
             io.WantCaptureKeyboard = true;
             io.WantCaptureMouse = true;
             
             ImGui::StyleColorsDark();
-            
+
             ImGui_ImplWin32_Init(gHwnd);
             ImGui_ImplDX11_Init(pDevice, pContext);
 
             init = true;
         }
 
-        SetHealth = (SetHealthFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + SET_HEALTH_RVA);
-        SetSpecial = (SetSpecialFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + SET_SPECIAL_RVA);
-        GetKickCooldown = (GetKickCooldownFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + GET_KICK_COOLDOWN_RVA);
-        SetKickCooldown = (SetKickCooldownFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + SET_KICK_COOLDOWN_RVA);
+        hook::SetHealth = (SetHealthFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::SET_HEALTH_RVA);
+        hook::SetSpecial = (SetSpecialFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::SET_SPECIAL_RVA);
+        hook::GetKickCooldown = (GetKickCooldownFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::GET_KICK_COOLDOWN_RVA);
+        hook::SetKickCooldown = (SetKickCooldownFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::SET_KICK_COOLDOWN_RVA);
+        hook::CurrentWeapon = (CurrentWeaponFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::CURRENT_WEAPON_RVA);
+        hook::HasWeapon = (HasWeaponFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::HAS_WEAPON_RVA);
+        hook::IsLocalPlayer = (IsLocalPlayerFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::IS_LOCAL_PLAYER_RVA);
+        hook::Exists = (ExistsFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::EXISTS_RVA);
+        hook::GetTransform = (GetTransformFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::GET_TRANSFORM_RVA);
+        hook::WorldToScreenPoint = (WorldToScreenPointFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::WTSP_RVA);
+        hook::GetMain = (GetMainFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::GET_MAIN_RVA);
+        hook::GetPosition = (GetPositionFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::GET_POSITION_RVA);
+        hook::GetHealthPct = (GetHealthPctFn)((uintptr_t)GetModuleHandleA("GameAssembly.dll") + offset::GET_HEALTH_PCT_RVA);
     }
 
     if(init)
@@ -175,8 +237,59 @@ HRESULT __stdcall detour_present(IDXGISwapChain* pSwapChain, UINT SyncInterval, 
             ImGui::NewFrame();
 
             ImGuiIO& io = ImGui::GetIO();
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+            // ImGuiStyle *style = &ImGui::GetStyle();
+            // style->WindowPadding = ImVec2(15, 15);
+            // style->WindowRounding = 5.0f;
+            // style->FramePadding = ImVec2(5, 5);
+            // style->FrameRounding = 4.0f;
+            // style->ItemSpacing = ImVec2(12, 8);
+            // style->ItemInnerSpacing = ImVec2(8, 6);
+            // style->IndentSpacing = 25.0f;
+            // style->ScrollbarSize = 15.0f;
+            // style->ScrollbarRounding = 9.0f;
+            // style->GrabMinSize = 5.0f;
+            // style->GrabRounding = 3.0f;
+            //
+            // style->Colors[ImGuiCol_Text] = ImVec4(0.80f, 0.80f, 0.83f, 1.00f);
+            // style->Colors[ImGuiCol_TextDisabled] = ImVec4(0.24f, 0.23f, 0.29f, 1.00f);
+            // style->Colors[ImGuiCol_WindowBg] = ImVec4(0.06f, 0.05f, 0.07f, 1.00f);
+            // style->Colors[ImGuiCol_PopupBg] = ImVec4(0.07f, 0.07f, 0.09f, 1.00f);
+            // style->Colors[ImGuiCol_Border] = ImVec4(0.80f, 0.80f, 0.83f, 0.88f);
+            // style->Colors[ImGuiCol_BorderShadow] = ImVec4(0.92f, 0.91f, 0.88f, 0.00f);
+            // style->Colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.09f, 0.12f, 1.00f);
+            // style->Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.23f, 0.29f, 1.00f);
+            // style->Colors[ImGuiCol_FrameBgActive] = ImVec4(0.56f, 0.56f, 0.58f, 1.00f);
+            // style->Colors[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.09f, 0.12f, 1.00f);
+            // style->Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(1.00f, 0.98f, 0.95f, 0.75f);
+            // style->Colors[ImGuiCol_TitleBgActive] = ImVec4(0.07f, 0.07f, 0.09f, 1.00f);
+            // style->Colors[ImGuiCol_MenuBarBg] = ImVec4(0.10f, 0.09f, 0.12f, 1.00f);
+            // style->Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.10f, 0.09f, 0.12f, 1.00f);
+            // style->Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.80f, 0.80f, 0.83f, 0.31f);
+            // style->Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.56f, 0.56f, 0.58f, 1.00f);
+            // style->Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.06f, 0.05f, 0.07f, 1.00f);
+            // style->Colors[ImGuiCol_CheckMark] = ImVec4(0.80f, 0.80f, 0.83f, 0.31f);
+            // style->Colors[ImGuiCol_SliderGrab] = ImVec4(0.80f, 0.80f, 0.83f, 0.31f);
+            // style->Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.06f, 0.05f, 0.07f, 1.00f);
+            // style->Colors[ImGuiCol_Button] = ImVec4(0.10f, 0.09f, 0.12f, 1.00f);
+            // style->Colors[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.23f, 0.29f, 1.00f);
+            // style->Colors[ImGuiCol_ButtonActive] = ImVec4(0.56f, 0.56f, 0.58f, 1.00f);
+            // style->Colors[ImGuiCol_Header] = ImVec4(0.10f, 0.09f, 0.12f, 1.00f);
+            // style->Colors[ImGuiCol_HeaderHovered] = ImVec4(0.56f, 0.56f, 0.58f, 1.00f);
+            // style->Colors[ImGuiCol_HeaderActive] = ImVec4(0.06f, 0.05f, 0.07f, 1.00f);
+            // style->Colors[ImGuiCol_ResizeGrip] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+            // style->Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.56f, 0.56f, 0.58f, 1.00f);
+            // style->Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.06f, 0.05f, 0.07f, 1.00f);
+            // style->Colors[ImGuiCol_PlotLines] = ImVec4(0.40f, 0.39f, 0.38f, 0.63f);
+            // style->Colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.25f, 1.00f, 0.00f, 1.00f);
+            // style->Colors[ImGuiCol_PlotHistogram] = ImVec4(0.40f, 0.39f, 0.38f, 0.63f);
+            // style->Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.25f, 1.00f, 0.00f, 1.00f);
+            // style->Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.25f, 1.00f, 0.00f, 0.43f);
+            // style->Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(1.00f, 0.98f, 0.95f, 0.73f);
+
+            static int hitbox_type_i = 0;
+            const char *types[] = {"Hitbox", "Hitbox + Health bar", "Hitbox (health color)"};
+            static bool show_hp_pct = false;
+            static bool show_enemy_count = false;
 
             if(show_menu)
             {
@@ -184,22 +297,171 @@ HRESULT __stdcall detour_present(IDXGISwapChain* pSwapChain, UINT SyncInterval, 
                 io.WantCaptureMouse = true;
                 ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
-                ImGui::Begin("Cheat Menu", nullptr, ImGuiWindowFlags_None);
-                ImGui::Text("Made by Strahinja");
-                ImGui::Separator();
-                ImGui::Checkbox("Godmode", &godMode);
-                ImGui::Checkbox("Unlimited Special", &infiniteSpecial);
-                ImGui::Checkbox("Unlimited Kick", &enableCooldown);
-                ImGui::Separator();
-                ImGui::Text("Found localPlayer at %p", gPlayerInstance);
-                ImGui::Text("Press F3 to toggle menu");
-                ImGui::Text("Press F4 to exit menu");
+                ImGui::Begin("PTTREasy", &show_menu);
+                ImGui::BeginTabBar("tabs");
+                if(ImGui::BeginTabItem("Cheats"))
+                {
+                    ImGui::Checkbox("Godmode", &global::godMode);
+                    ImGui::Checkbox("Unlimited Special", &global::infiniteSpecial);
+                    ImGui::Checkbox("Unlimited Kick", &global::enableCooldown);
+                    ImGui::Checkbox("Unbreakable Weapon", &global::unbreakable);
+                    ImGui::Checkbox("ESP", &global::esp);
+                    ImGui::EndTabItem();
+                }
+                if(ImGui::BeginTabItem("Config"))
+                {
+                    ImGui::ColorEdit4("ESP Box Color", global::box_col);
+                    ImGui::Combo("Hitbox Type", &hitbox_type_i, types, IM_ARRAYSIZE(types));
+                    ImGui::Checkbox("Show HP%", &show_hp_pct);
+                    ImGui::Checkbox("Show Enemy Count", &show_enemy_count);
+                    ImGui::EndTabItem();
+                }
+                if(ImGui::BeginTabItem("Debug"))
+                {
+                    if(gPlayerInstance)
+                    {
+                        ImGui::Text("Status: Found localPlayer at %p", gPlayerInstance);
+                    }
+                    else
+                    {
+                        ImGui::Text("Status: Not in-game");
+                        global::godMode = false;
+                        global::infiniteSpecial = false;
+                        global::enableCooldown = false;
+                        global::esp = false;
+                        global::unbreakable = false;
+                    }
+                    ImGui::Text("Camera.main: %p", mainCam);
+                    ImGui::EndTabItem();
+                }
+                if(ImGui::BeginTabItem("About"))
+                {
+                    ImGui::Text("Made by Strahinja (c) 2026");
+                    ImGui::Spacing();
+                    ImGui::Text("Version: v2.3");
+                    ImGui::EndTabItem();
+                }
+                if(ImGui::BeginTabItem("Help"))
+                {
+                    ImGui::Text("Press F3 to toggle menu");
+                    ImGui::Text("Press F4 to unload menu");
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
                 ImGui::End();
             }
             else
             {
                 io.WantCaptureKeyboard = false;
                 io.WantCaptureMouse = false;
+            }
+
+            auto draw = ImGui::GetBackgroundDrawList();
+
+            if(show_enemy_count)
+            {
+                char count_fmt[32];
+                sprintf(count_fmt, "Enemies left: %llu", enemies.size());
+                AddOutlinedText(draw, ImVec2(100, 100), IM_COL32(0, 255, 0, 255), IM_COL32(0, 0, 0, 255), count_fmt);
+            }
+
+            mainCam = hook::GetMain(nullptr);
+            if(global::esp && mainCam)
+            {
+                for(auto enemy : enemies)
+                {
+                    float hp = hook::GetHealthPct(enemy, nullptr);
+                    hp = std::clamp(hp, 0.0f, 1.0f);
+
+                    Transform* transform = hook::GetTransform(enemy, nullptr);
+                    if(!transform) continue;
+
+                    Vector3 world = hook::GetPosition(transform, nullptr);
+
+                    Vector3 feet = world;
+                    Vector3 head = world;
+                    head.y += 2.f;
+
+                    Vector3 feetScreen = hook::WorldToScreenPoint(mainCam, feet, nullptr);
+                    Vector3 headScreen = hook::WorldToScreenPoint(mainCam, head, nullptr);
+
+                    feetScreen.y = 1080 - feetScreen.y;
+                    headScreen.y = 1080 - headScreen.y;
+
+                    if(feetScreen.z > 0 && headScreen.z > 0)
+                    {
+                        float height = feetScreen.y - headScreen.y;
+                        float width = height * 0.5f;
+                        float healthHeight = height * hp;
+
+                        int r = (int)((1.0f - hp) * 255);
+                        int g = (int)(hp * 255);
+                        ImU32 healthColor = IM_COL32(r, g, 0, 255);
+                        float barX = headScreen.x - width/2 - 6;
+
+                        if(hitbox_type_i == HitboxType::HITBOX_HEALTH_BAR)
+                        {
+                            draw->AddRectFilled(
+                                    ImVec2(barX, headScreen.y),
+                                    ImVec2(barX + 4, feetScreen.y),
+                                    IM_COL32(0,0,0,180)
+                                    );
+                            draw->AddRectFilled(
+                                    ImVec2(barX, feetScreen.y - healthHeight),
+                                    ImVec2(barX + 4, feetScreen.y),
+                                    healthColor
+                                    );
+                            draw->AddRect(
+                                    ImVec2(barX, headScreen.y),
+                                    ImVec2(barX + 4, feetScreen.y),
+                                    IM_COL32(0,0,0,255)
+                                    );
+
+                            ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(
+                                        global::box_col[0],
+                                        global::box_col[1],
+                                        global::box_col[2],
+                                        global::box_col[3]
+                                        ));
+
+                            draw->AddRect(
+                                    ImVec2(headScreen.x - width/2, headScreen.y),
+                                    ImVec2(headScreen.x + width/2, feetScreen.y),
+                                    col
+                                    );
+                        }
+                        if(hitbox_type_i == HitboxType::HITBOX_NORMAL)
+                        {
+                            ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(
+                                        global::box_col[0],
+                                        global::box_col[1],
+                                        global::box_col[2],
+                                        global::box_col[3]
+                                        ));
+
+                            draw->AddRect(
+                                    ImVec2(headScreen.x - width/2, headScreen.y),
+                                    ImVec2(headScreen.x + width/2, feetScreen.y),
+                                    col
+                                    );
+                        }
+                        if(hitbox_type_i == HitboxType::HITBOX_HEALTH_COLOR)
+                        {
+                            draw->AddRect(
+                                    ImVec2(headScreen.x - width/2, headScreen.y),
+                                    ImVec2(headScreen.x + width/2, feetScreen.y),
+                                    healthColor
+                                    );
+                        }
+
+                        if(show_hp_pct)
+                        {
+                            char hp_pct[32];
+                            sprintf(hp_pct, "%.0f", hp * 100.0f);
+                            AddOutlinedText(draw, ImVec2(headScreen.x - width/2 - 6 - (strlen(hp_pct) * 2), feetScreen.y - healthHeight), IM_COL32(255, 255, 255, 255), IM_COL32(0, 0, 0, 255), hp_pct);
+                        }
+                    }
+                }
             }
 
             ImGui::EndFrame();
@@ -211,6 +473,8 @@ HRESULT __stdcall detour_present(IDXGISwapChain* pSwapChain, UINT SyncInterval, 
             if(mainRTV) mainRTV->Release();
         }
     }
+
+    enemies.clear();
 
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
@@ -225,20 +489,28 @@ DWORD WINAPI MainThread(LPVOID lpParameter)
     MH_Initialize();
 
     uintptr_t base = (uintptr_t)GetModuleHandleA("GameAssembly.dll");
-    uintptr_t updateAddr = base + UPDATE_RVA;
+    uintptr_t updateAddr = base + offset::UPDATE_RVA;
 
-    MH_CreateHook((LPVOID)updateAddr, (void*)&hkUpdate, reinterpret_cast<LPVOID*>(&oUpdate));
+    MH_CreateHook((LPVOID)updateAddr, (void*)&hook::Update, reinterpret_cast<LPVOID*>(&oUpdate));
     MH_EnableHook((LPVOID)updateAddr);
 
-    uintptr_t disableGCAddr = base + DISABLE_CONTROLS_RVA;
-    uintptr_t enableGCAddr = base + ENABLE_CONTROLS_RVA;
-    uintptr_t setVisibleAddr = base + CURSOR_VISIBLE_SET_RVA;
-    uintptr_t setLockAddr = base + CURSOR_LOCK_SET_RVA;
+    uintptr_t enemyUpdateAddr = base + 0x391710;
 
-    MH_CreateHook((LPVOID)disableGCAddr, (void*)&hkDisableGameplayControls, reinterpret_cast<LPVOID*>(&oDisableGameplayControls));
+    MH_CreateHook(
+            (LPVOID)enemyUpdateAddr,
+            (void*)&hook::EnemyDoUpdate,
+            reinterpret_cast<LPVOID*>(&oEnemyDoUpdate)
+            );
+
+    MH_EnableHook((LPVOID)enemyUpdateAddr);
+
+    uintptr_t disableGCAddr = base + offset::DISABLE_CONTROLS_RVA;
+    uintptr_t enableGCAddr = base + offset::ENABLE_CONTROLS_RVA;
+
+    MH_CreateHook((LPVOID)disableGCAddr, (void*)&hook::DisableGameplayControls, reinterpret_cast<LPVOID*>(&hook::oDisableGameplayControls));
     MH_EnableHook((LPVOID)disableGCAddr);
 
-    MH_CreateHook((LPVOID)enableGCAddr, (void*)&hkEnableGameplayControls, reinterpret_cast<LPVOID*>(&oEnableGameplayControls));
+    MH_CreateHook((LPVOID)enableGCAddr, (void*)&hook::EnableGameplayControls, reinterpret_cast<LPVOID*>(&hook::oEnableGameplayControls));
     MH_EnableHook((LPVOID)enableGCAddr);
 
     while(true)
@@ -249,8 +521,8 @@ DWORD WINAPI MainThread(LPVOID lpParameter)
             show_menu = !show_menu;
 
             if(show_menu)
-                oDisableGameplayControls();
-            else oEnableGameplayControls();
+                hook::oDisableGameplayControls();
+            else hook::oEnableGameplayControls();
         }
         if(GetAsyncKeyState(VK_F4) & 0x01) break;
     }
