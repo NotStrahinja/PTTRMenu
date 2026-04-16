@@ -16,7 +16,8 @@ Yes.
 - [x] Infinite Ability
 - [x] Infinite Kick
 - [ ] Unlimited Ammo
-- [ ] Unlimited Weapon Durability
+- [X] Unlimited Weapon Durability
+- [X] ESP
 
 # How to compile
 Just run the build.bat file provided. It will build both the menu DLL and the injector.
